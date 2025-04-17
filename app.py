@@ -111,25 +111,18 @@ if league_id:
         flex_cap = st.number_input("Other positions cap", 0, 10, 5)
         pos_caps = {"RB": rb_cap, "WR": wr_cap, "TE": te_cap, "QB": qb_cap, "UNK": flex_cap}
 
-        protection_overrides = {}
-        for owner, roster_ids in rosters.items():
-            if not roster_ids:
-                continue
-            team_label = id_to_team.get(owner, f"Owner {owner}")
-            protection_overrides[owner] = st.multiselect(f"{team_label} protects", roster_ids, default=roster_ids[:max_protect], format_func=lambda pid: id_to_name.get(pid, pid))
-
         use_ai = st.checkbox("🤖 Use AI for protections & draft")
         run = st.button("▶️ Run Simulation & Draft")
 
     if run:
         if use_ai:
             client = OpenAI(api_key=st.secrets["openai"]["api_key"])
-            final_protected = {
-                owner: ai_protect(rosters[owner], id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps, client)
-                for owner in protection_overrides
-            }
+            final_protected = {}
+            for owner, roster_ids in rosters.items():
+                if roster_ids:
+                    final_protected[owner] = ai_protect(roster_ids, id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps, client)
         else:
-            final_protected = protection_overrides
+            final_protected = {owner: roster_ids[:max_protect] for owner, roster_ids in rosters.items()}
 
         breakdown, pool_ids, picks_by_team = simulate_and_draft(
             rosters, id_to_name, id_to_pos, max_protect, pos_caps,
