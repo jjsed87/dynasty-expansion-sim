@@ -4,7 +4,7 @@ import streamlit as st
 import requests
 import json
 import pandas as pd
-from openai import OpenAI
+import openai
 
 st.set_page_config(layout="wide")
 st.title("Dynasty League Expansion Draft Simulator")
@@ -71,19 +71,21 @@ def simulate_and_draft(rosters, id_to_name, id_to_pos, max_protect, pos_caps, nu
     return breakdown, draft_pool_ids, picks
 
 # --- AI functions ---
-def ai_protect(roster_ids, id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps, client):
+def ai_protect(roster_ids, id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps):
     if not roster_ids:
         return []
     roster_list = [{"name": id_to_name[p], "position": id_to_pos[p], "rank": id_to_rank.get(id_to_name[p], 9999)} for p in roster_ids]
     prompt = (
-        "You're a fantasy football GM. Protect exactly " + str(max_protect) + " players based on dynasty rankings (lower rank is better), position scarcity, and long-term potential. "
-        f"Roster: {json.dumps(roster_list)}. Max positional losses: {json.dumps(pos_caps)}. Respond with a JSON array of names."
+        f"You are an expert fantasy football GM. Select exactly {max_protect} players to PROTECT from this dynasty league roster: {json.dumps(roster_list)}. "
+        f"Consider player rankings (lower is better), positional scarcity, and long-term value. Max positional losses allowed: {json.dumps(pos_caps)}. "
+        "Respond with a JSON array of protected player names."
     )
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system", "content":"Fantasy roster protection."}, {"role":"user", "content":prompt}],
-            temperature=0.2
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "system", "content": "You select optimal players to protect."}, {"role": "user", "content": prompt}],
+            temperature=0.1,
+            timeout=30
         )
         names = json.loads(resp.choices[0].message.content)
     except Exception:
@@ -116,11 +118,11 @@ if league_id:
 
     if run:
         if use_ai:
-            client = OpenAI(api_key=st.secrets["openai"]["api_key"])
+            openai.api_key = st.secrets["openai"]["api_key"]
             final_protected = {}
             for owner, roster_ids in rosters.items():
                 if roster_ids:
-                    final_protected[owner] = ai_protect(roster_ids, id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps, client)
+                    final_protected[owner] = ai_protect(roster_ids, id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps)
         else:
             final_protected = {owner: roster_ids[:max_protect] for owner, roster_ids in rosters.items()}
 
