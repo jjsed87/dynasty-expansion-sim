@@ -4,29 +4,45 @@ import streamlit as st
 import requests
 import json
 import pandas as pd
+import openai
+
+st.set_page_config(layout="wide")
+st.title("Dynasty League Expansion Draft Simulator")
 
 # --- Data loading ---
 @st.cache_data
-def load_league_rosters(league_id):
+def load_league_data(league_id):
+    # Rosters
     rosters = requests.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters").json()
+    # Player info
     players = requests.get("https://api.sleeper.app/v1/players/nfl").json()
+    # Team/user info
+    users   = requests.get(f"https://api.sleeper.app/v1/league/{league_id}/users").json()
 
+    # Build mappings
     id_to_name = {}
-    id_to_pos = {}
+    id_to_pos  = {}
     for pid, pdata in players.items():
-        name = pdata.get("full_name") or f"{pdata.get('first_name','')} {pdata.get('last_name','')}.strip()"
-        id_to_name[pid] = name
-        id_to_pos[pid] = pdata.get("position", "UNK")
+        full = pdata.get("full_name") or f"{pdata.get('first_name','')} {pdata.get('last_name','')}".strip()
+        id_to_name[pid] = full
+        id_to_pos[pid]  = pdata.get("position","UNK")
 
-    league_rosters = {team.get("owner_id"): team.get("players") or [] for team in rosters}
-    return league_rosters, id_to_name, id_to_pos
+    id_to_team = {u["user_id"]: u["display_name"] for u in users}
 
-# --- Expansion & draft logic ---
+    # Owner → list of player IDs
+    league_rosters = {
+        team["owner_id"]: team.get("players") or []
+        for team in rosters
+    }
+
+    return league_rosters, id_to_name, id_to_pos, id_to_team
+
+# --- Core logic (no-AI) ---
 def simulate_and_draft(rosters, id_to_name, id_to_pos,
                        max_protect, pos_caps, num_teams, picks_per_team,
                        draft_format, protection_overrides):
     breakdown = {}
-    pool = []
+    pool      = []
 
     for owner, roster_ids in rosters.items():
         protected = protection_overrides.get(owner, roster_ids[:max_protect])[:max_protect]
@@ -47,107 +63,176 @@ def simulate_and_draft(rosters, id_to_name, id_to_pos,
         }
         pool.extend(losses)
 
-    total_picks = num_teams * picks_per_team
+    total_picks    = num_teams * picks_per_team
     draft_pool_ids = pool[:total_picks]
-    draft_pool_names = [id_to_name[p] for p in draft_pool_ids]
 
-    # Execute the draft order
+    # Draft execution (snake or linear)
     teams = [f"Expansion Team {i+1}" for i in range(num_teams)]
-    picks_by_team_ids = {team: [] for team in teams}
+    picks = {t: [] for t in teams}
     for idx, pid in enumerate(draft_pool_ids):
         if draft_format == "Snake":
-            rnd = idx // num_teams
+            rnd   = idx // num_teams
             order = teams if rnd % 2 == 0 else list(reversed(teams))
-            team = order[idx % num_teams]
+            team  = order[idx % num_teams]
         else:
             team = teams[idx % num_teams]
-        picks_by_team_ids[team].append(pid)
+        picks[team].append(pid)
 
-    return breakdown, draft_pool_names, picks_by_team_ids
+    return breakdown, draft_pool_ids, picks
 
-# --- Streamlit UI ---
-st.set_page_config(layout="wide")
-st.title("Dynasty League Expansion Draft Simulator")
+# --- AI helpers ---
+def ai_protect(roster_ids, id_to_name, id_to_pos, max_protect, pos_caps):
+    # Build a JSON roster list
+    roster_list = [{"name": id_to_name[p], "position": id_to_pos[p]} for p in roster_ids]
+    prompt = (
+        "You are a fantasy football front office. "
+        f"Here is a roster: {json.dumps(roster_list)}. "
+        f"Protect exactly {max_protect} players, with max losses per position {json.dumps(pos_caps)}. "
+        "Return a JSON array of the protected player names (exactly)."
+    )
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"system","content":"You help pick protections."},
+                  {"role":"user","content":prompt}],
+        temperature=0.4
+    )
+    names = json.loads(resp.choices[0].message.content)
+    # Map names back to IDs (first match)
+    name_to_id = {v:k for k,v in id_to_name.items()}
+    return [ name_to_id.get(n) for n in names if name_to_id.get(n) ]
 
-league_id = st.text_input("Sleeper League ID", value="1186327865394335744")
+def ai_draft(pool_ids, id_to_name, num_teams, picks_per_team, draft_format):
+    pool_list = [id_to_name[p] for p in pool_ids]
+    prompt = (
+        "You are a fantasy draft assistant. "
+        f"Available players: {json.dumps(pool_list)}. "
+        f"Perform a {draft_format} draft for {num_teams} teams, {picks_per_team} picks each. "
+        "Return a JSON object mapping team names to arrays of player names."
+    )
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"system","content":"You help run drafts."},
+                  {"role":"user","content":prompt}],
+        temperature=0.4
+    )
+    mapping = json.loads(resp.choices[0].message.content)
+    # invert name→id
+    name_to_id = {v:k for k,v in id_to_name.items()}
+    return { team: [name_to_id.get(n) for n in names if name_to_id.get(n)] 
+             for team,names in mapping.items() }
+
+# --- UI ---
+league_id = st.text_input("🔢 Enter your Sleeper League ID", value="1186327865394335744")
+
 if league_id:
-    rosters, id_to_name, id_to_pos = load_league_rosters(league_id)
+    rosters, id_to_name, id_to_pos, id_to_team = load_league_data(league_id)
 
-    # Sidebar controls
-    st.sidebar.header("Draft Settings")
-    max_protect = st.sidebar.slider("Max Protected per Team", 0, 20, 12)
-    num_teams = st.sidebar.number_input("Expansion Teams", 1, 4, 2)
-    picks_per_team = st.sidebar.number_input("Picks per Expansion Team", 1, 50, 25)
-    draft_format = st.sidebar.radio("Draft Format", ["Snake", "Linear"], index=0)
+    with st.expander("⚙️ Settings", expanded=True):
+        max_protect    = st.slider("Max Protected per Team", 0, 20, 12)
+        num_teams      = st.number_input("Expansion Teams", 1, 4, 2)
+        picks_per_team = st.number_input("Picks per Expansion Team", 1, 50, 25)
+        draft_format   = st.radio("Draft Format", ["Snake", "Linear"], index=0)
 
-    st.sidebar.subheader("Position Loss Caps")
-    rb_cap = st.sidebar.number_input("RB cap", 0, 10, 2)
-    wr_cap = st.sidebar.number_input("WR cap", 0, 10, 3)
-    te_cap = st.sidebar.number_input("TE cap", 0, 10, 1)
-    qb_cap = st.sidebar.number_input("QB cap", 0, 5, 1)
-    flex_cap = st.sidebar.number_input("Other positions cap", 0, 10, 5)
-    pos_caps = {"RB": rb_cap, "WR": wr_cap, "TE": te_cap, "QB": qb_cap}
-    for pos in set(id_to_pos.values()):
-        if pos not in pos_caps:
-            pos_caps[pos] = flex_cap
+        st.write("**Position Loss Caps**")
+        rb_cap   = st.number_input("RB cap", 0, 10, 2)
+        wr_cap   = st.number_input("WR cap", 0, 10, 3)
+        te_cap   = st.number_input("TE cap", 0, 10, 1)
+        qb_cap   = st.number_input("QB cap", 0, 5, 1)
+        flex_cap = st.number_input("Other positions cap", 0, 10, 5)
+        pos_caps = {"RB": rb_cap, "WR": wr_cap, "TE": te_cap, "QB": qb_cap}
+        for p in set(id_to_pos.values()):
+            if p not in pos_caps:
+                pos_caps[p] = flex_cap
 
-    # Protection Overrides
-    st.sidebar.subheader("Protection Overrides")
-    protection_overrides = {}
-    for owner, roster_ids in rosters.items():
-        protection_overrides[owner] = st.sidebar.multiselect(
-            f"Protected for {owner}", roster_ids,
-            default=roster_ids[:max_protect],
-            format_func=lambda pid: id_to_name.get(pid, pid)
-        )
+        st.write("**Manual Protection Overrides**")
+        protection_overrides = {}
+        for owner, roster_ids in rosters.items():
+            protection_overrides[owner] = st.multiselect(
+                f"{id_to_team[owner]} protects",
+                roster_ids,
+                default=roster_ids[:max_protect],
+                format_func=lambda pid: id_to_name.get(pid, pid)
+            )
 
-    # Run simulation & draft
-    if st.sidebar.button("Run Simulation & Draft"):
-        breakdown, draft_pool, picks_by_team_ids = simulate_and_draft(
+        use_ai = st.checkbox("🤖 Use AI for protections & draft")
+        run    = st.button("▶️ Run Simulation & Draft")
+
+    if run:
+        # enforce manual protections
+        if not use_ai:
+            invalid = [o for o,p in protection_overrides.items() if len(p)!=max_protect]
+            if invalid:
+                st.error(
+                    f"Each team must protect exactly {max_protect} players! "
+                    f"Check: {', '.join(id_to_team[o] for o in invalid)}"
+                )
+                st.stop()
+            final_protected = protection_overrides
+        else:
+            openai.api_key = st.secrets["openai"]["api_key"]
+            final_protected = {
+                o: ai_protect(r, id_to_name, id_to_pos, max_protect, pos_caps)
+                for o,r in rosters.items()
+            }
+
+        # simulate & draft
+        breakdown, pool_ids, picks_by_team = simulate_and_draft(
             rosters, id_to_name, id_to_pos,
             max_protect, pos_caps, num_teams, picks_per_team,
-            draft_format, protection_overrides
+            draft_format, final_protected
         )
 
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Team Breakdown", "Draft Pool", "Draft Results", "Expansion Rosters"]
-        )
+        # if AI drafting
+        if use_ai:
+            ai_picks = ai_draft(pool_ids, id_to_name, num_teams, picks_per_team, draft_format)
+            picks_by_team = ai_picks
+
+        # ---- display results ----
+        tab1,tab2,tab3,tab4 = st.tabs([
+            "Team Breakdown","Draft Pool","Draft Results","Expansion Rosters"
+        ])
 
         with tab1:
             df1 = pd.DataFrame([
-                {"Owner": o,
-                 "Protected Count": len(d["protected"]),
-                 "Loss Count": len(d["losses"]),
-                 "Protected": ", ".join(d["protected"]),
-                 "Losses": ", ".join(d["losses"])}
-                for o, d in breakdown.items()
+                {
+                    "Team":        id_to_team[o],
+                    "Protected":   ", ".join(b["protected"]),
+                    "Losses":      ", ".join(b["losses"])
+                }
+                for o,b in breakdown.items()
             ])
             st.dataframe(df1, use_container_width=True)
             st.download_button("Download Breakdown CSV", df1.to_csv(index=False), "breakdown.csv")
 
         with tab2:
-            df2 = pd.DataFrame({"Player": draft_pool})
+            df2 = pd.DataFrame({"Player": [id_to_name[p] for p in pool_ids]})
             st.dataframe(df2, use_container_width=True)
             st.download_button("Download Pool CSV", df2.to_csv(index=False), "pool.csv")
 
         with tab3:
-            rows = []
-            pick_num = 1
-            for team, pids in picks_by_team_ids.items():
+            rows=[]
+            num=1
+            for team, pids in picks_by_team.items():
                 for pid in pids:
-                    rows.append({"Pick": pick_num, "Team": team, "Player": id_to_name.get(pid, pid)})
-                    pick_num += 1
+                    rows.append({"Pick": num, "Team": team, "Player": id_to_name.get(pid,pid)})
+                    num+=1
             df3 = pd.DataFrame(rows)
             st.dataframe(df3, use_container_width=True)
             st.download_button("Download Draft Results CSV", df3.to_csv(index=False), "results.csv")
 
         with tab4:
-            for team, pids in picks_by_team_ids.items():
+            for team, pids in picks_by_team.items():
                 st.subheader(team)
-                rows = [{"Player": id_to_name.get(pid, pid), "Position": id_to_pos.get(pid, "UNK")} for pid in pids]
-                df4 = pd.DataFrame(rows)
+                df4 = pd.DataFrame([
+                    {"Player": id_to_name.get(pid,pid), "Position": id_to_pos.get(pid,"UNK")}
+                    for pid in pids
+                ])
                 st.table(df4)
-                st.download_button(f"Download {team} Roster CSV", df4.to_csv(index=False), f"{team}_roster.csv")
+                st.download_button(
+                    f"Download {team} Roster CSV",
+                    df4.to_csv(index=False),
+                    f"{team.replace(' ','_')}_roster.csv"
+                )
 
-        st.success("Simulation and draft complete! Change settings to rerun.")
+        st.success("✅ Done! Adjust settings to simulate again.")
 
