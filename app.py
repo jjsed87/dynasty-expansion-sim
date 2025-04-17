@@ -123,7 +123,14 @@ if league_id:
 
     if run:
         client = OpenAI(api_key=st.secrets["openai"]["api_key"]) if use_ai else None
-        final_protected = {owner: ai_protect(roster, id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps, client) if use_ai else picks for owner, picks in protection_overrides.items()}
+if use_ai:
+    client = OpenAI(api_key=st.secrets["openai"]["api_key"])
+    final_protected = {
+        owner: ai_protect(rosters[owner], id_to_name, id_to_pos, id_to_rank, max_protect, pos_caps, client)
+        for owner in protection_overrides
+    }
+else:
+    final_protected = protection_overrides
 
         breakdown, pool_ids, picks_by_team = simulate_and_draft(rosters, id_to_name, id_to_pos, max_protect, pos_caps, num_teams, picks_per_team, draft_format, final_protected)
 
