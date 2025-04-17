@@ -31,7 +31,7 @@ def load_league_data(league_id):
 @st.cache_data
 def load_rankings(path="FantasyPros_2025_Dynasty_ALL_Rankings.csv"):
     df = pd.read_csv(path)
-    return {row["Player"]: row["Rank"] for _, row in df.iterrows()}
+    return {row["PLAYER NAME"]: row["RK"] for _, row in df.iterrows()}
 
 # --- Simulation and draft logic ---
 def simulate_and_draft(rosters, id_to_name, id_to_pos, max_protect, pos_caps, num_teams, picks_per_team, draft_format, protection_overrides):
